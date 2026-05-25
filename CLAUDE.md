@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+# 语言偏好
+请始终使用简体中文回答所有问题。
+代码注释和文档也默认使用中文。
+
 ## Overview
 
 Windows TCP 透传（端口转发）工具，Python 3 + tkinter 实现，零外部依赖。监听指定 IP/端口，将连接数据双向转发到目标地址，GUI 实时展示日志和十六进制数据。

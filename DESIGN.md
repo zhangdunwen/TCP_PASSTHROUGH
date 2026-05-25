@@ -56,12 +56,12 @@ TCP 透传（端口转发）工具，在本地监听指定端口，将接入的 
 
 ### 3.2 模块职责
 
-| 模块 | 职责 | 文件位置 |
-|------|------|----------|
-| `ConfigManager` | JSON 配置读写，首次自动生成默认配置 | `tcp_forward.py:59-76` |
-| `TcpForwarder` | TCP 转发核心引擎，管理 socket 生命周期和双向数据转发 | `tcp_forward.py:95-254` |
-| `App` | tkinter GUI 主窗口，UI 构建、事件处理、队列轮询 | `tcp_forward.py:261-689` |
-| `queue.Queue` | 线程安全消息队列，解耦转发线程与 GUI 线程 | 标准库 |
+| 模块              | 职责                               | 文件位置                     |
+| --------------- | -------------------------------- | ------------------------ |
+| `ConfigManager` | JSON 配置读写，首次自动生成默认配置             | `tcp_forward.py:59-76`   |
+| `TcpForwarder`  | TCP 转发核心引擎，管理 socket 生命周期和双向数据转发 | `tcp_forward.py:95-254`  |
+| `App`           | tkinter GUI 主窗口，UI 构建、事件处理、队列轮询  | `tcp_forward.py:261-689` |
+| `queue.Queue`   | 线程安全消息队列，解耦转发线程与 GUI 线程          | 标准库                      |
 
 ---
 
@@ -170,13 +170,13 @@ TcpForwarder
 
 ### 5.3 关键设计点
 
-| 设计点 | 实现 | 原因 |
-|--------|------|------|
-| Socket 超时 | `settimeout(1.0)` | 避免 recv/accept 无限阻塞，保证 stop() 1 秒内响应 |
-| 停止机制 | `_stop_event` + socket close 双保险 | 线程可能卡在 recv，close socket 可强制打断 |
-| 单连接限制 | `if self.client_sock is not None: reject` | 简化状态管理，避免多连接竞态 |
-| 数据缓冲 | `RECV_BUF = 65536` | 64KB 缓冲区，平衡内存与系统调用次数 |
-| 连接超时 | target connect 5s，之后重置为 1s | 避免 DNS/网络故障时长时间卡住 |
+| 设计点       | 实现                                        | 原因                                   |
+| --------- | ----------------------------------------- | ------------------------------------ |
+| Socket 超时 | `settimeout(1.0)`                         | 避免 recv/accept 无限阻塞，保证 stop() 1 秒内响应 |
+| 停止机制      | `_stop_event` + socket close 双保险          | 线程可能卡在 recv，close socket 可强制打断       |
+| 单连接限制     | `if self.client_sock is not None: reject` | 简化状态管理，避免多连接竞态                       |
+| 数据缓冲      | `RECV_BUF = 65536`                        | 64KB 缓冲区，平衡内存与系统调用次数                 |
+| 连接超时      | target connect 5s，之后重置为 1s                | 避免 DNS/网络故障时长时间卡住                    |
 
 ---
 
@@ -250,7 +250,9 @@ App (960×720, min 700×500)
 │       │   ├─ entry_send (Entry, Enter 键绑定)
 │       │   └─ btn_send
 │       │
-│       └─ data_text (ScrolledText, NONE wrap, Consolas 9)
+│       └─ data_text (Text, NONE wrap, Consolas 9)
+        ├─ 垂直滚动条 (ScrolledText 替换为手动布局)
+        └─ 水平滚动条 (新增，HEX 长行可左右拖动)
 ```
 
 ---
@@ -278,6 +280,10 @@ App (960×720, min 700×500)
 
 ### 7.2 数据转发（连接建立后自动触发）
 
+**转发层**（`_forward`）保持透明透传，逐 chunk 接收并转发。
+
+**展示层**（`_append_data`）以 `\r\n` 为消息边界累积数据。拿到完整消息后执行 Base64 解码 → AES 解密 → 格式化展示。`\r\n` 是安全的分隔符，因为 Base64 输出永不包含 `\r\n`（0x0D）、`\n`（0x0A）字节。
+
 ```
 Client ──connect──► server_sock
   │
@@ -287,21 +293,60 @@ Client ──connect──► server_sock
   ├─ queue.put("status", "connected")
   │
   ├─ Thread-1 (C→T):
-  │    loop: data = client_sock.recv(65536)
-  │          if data: target_sock.sendall(data)
-  │                   queue.put("data", "C→T", peer, data)
-  │          if not data: break (对端关闭)
+  │    loop: chunk = client_sock.recv(65536)
+  │          if not chunk: break (对端关闭)
+  │          target_sock.sendall(chunk)        ← 透明转发原始数据
+  │          queue.put("data", "C→T", peer, chunk)
   │
   └─ Thread-2 (T→C):
-       loop: data = target_sock.recv(65536)
-             if data: client_sock.sendall(data)
-                      queue.put("data", "T→C", peer, data)
-             if not data: break (对端关闭)
+       loop: chunk = target_sock.recv(65536)
+             if not chunk: break (对端关闭)
+             client_sock.sendall(chunk)        ← 透明转发原始数据
+             queue.put("data", "T→C", peer, chunk)
   │
   ├─ join() 等待两个转发线程结束
   ├─ 清理 socket
   └─ queue.put("status", "listening") + 日志 "连接已断开，继续监听..."
 ```
+
+**展示层行缓冲 + 解码**（`App._append_data` → `_display_msg` → `_extract_b64`，GUI 线程）：
+
+```
+queue 收到 ("data", tag, peer, raw_bytes)
+  │
+  ├─ buf += raw_bytes                         ← 追加到方向缓冲区
+  │
+  ├─ while b"\r\n" in buf:
+  │     msg, buf = buf.split(b"\r\n", 1)      ← 提取一条完整消息（不含 \r\n）
+  │     │
+  │     └─ _display_msg(tag, msg):
+  │          │
+  │          ├─ _extract_b64(msg):            ← 提取并解码 Base64 前缀
+  │          │   ├─ 尝试纯 Base64 解码 (validate=True)
+  │          │   ├─ 失败 → 扫描 Base64 前缀（A-Za-z0-9+/=）
+  │          │   ├─ 解码前缀 → 返回 (ciphertext, suffix)
+  │          │   └─ 非 Base64 → 返回 (msg, b"")
+  │          │
+  │          ├─ AES 解密（仅对 ciphertext 部分） ← 后缀不参与解密
+  │          │
+  │          └─ plaintext + suffix → 格式化写入面板
+  │
+  ├─ buf 仍留有不完整数据，等待后续 chunk
+  │
+  └─ 若 buf > 256KB 且无 \r\n → 视为二进制协议，直接展示并清空
+```
+
+**关键点说明：**
+
+| 项目 | 说明 |
+| --- | --- |
+| 为什么按 `\r\n` 缓冲 | 协议以 `\r\n` 为消息边界；Base64 输出不含 `\r\n`（0x0D/0x0A），分隔符安全 |
+| 为什么不把 `\r\n` 传进 `_display_msg` | `\r\n` 是协议分隔符，不是消息内容，带入会造成 AES 解密输入长度不对齐 |
+| Base64 前缀提取 | 支持 `BASE64==#后缀` 混合格式——只解码 Base64 前缀，后缀原样保留 |
+| AES 仅解密 ciphertext | `_extract_b64` 返回 `(密文, 后缀)` 两部分，AES 作用于密文部分，后缀不参与 |
+| `validate=True` | 严格校验 Base64 字符集，非 Base64 字节直接抛异常，防止静默产生垃圾数据 |
+| 转发层透传 | `_forward` 不修改数据流，保证 TCP 代理语义正确 |
+| 二进制协议兜底 | 缓冲区超 256KB 仍无 `\r\n`，视为非行协议，直接展示 |
 
 ### 7.3 停止转发
 
@@ -336,16 +381,34 @@ Client ──connect──► server_sock
 
 ### 7.5 数据解密展示
 
+行缓冲取出的每条完整消息（不含 `\r\n`）按以下管道处理：
+
 ```
-收到原始数据 bytes
+msg (bytes, 不含 \r\n)
   │
-  ├─ 可选: Base64 解码 (use_base64=True 时)
-  ├─ 可选: AES-128-CBC 解密 (aes_mode="AES-128-CBC" 时)
+  ├─ _extract_b64(msg):                   ← Base64 前缀提取（use_base64 开启时）
+  │   ├─ 纯 Base64 消息 → (ciphertext, b"")
+  │   ├─ 混合消息 BASE64==#后缀 → (ciphertext, b"#后缀")
+  │   └─ 非 Base64 消息 → (msg, b"")      ← 原文直接透传
+  │
+  ├─ AES 解密（仅 ciphertext 部分）          ← aes_mode="AES-128-CBC" 时
+  │   ├─ 成功 → plaintext
+  │   └─ 失败 → 返回原 ciphertext
+  │
+  ├─ plaintext + suffix                    ← 与后缀拼接
   │
   └─ 展示格式
        ├─ HEX 模式: _fmt_hex() → OFFSET + 16列HEX + ASCII
        └─ 字符串模式: decode("utf-8", errors="replace")
 ```
+
+**三种消息格式处理对比：**
+
+| 消息示例 | `_extract_b64` 结果 | AES 输入 | 最终展示 |
+|---------|-------------------|---------|---------|
+| `[8639...,1]` | `(msg, "")` | msg（非密文，解密失败→返回原文） | `[8639...,1]` |
+| `S8RR...==` | `(cipher, "")` | cipher（16 字节对齐） | 解密后的明文 |
+| `S8RR...==#CYY#CM-H98` | `(cipher, "#CYY#CM-H98")` | cipher（16 字节对齐） | 明文#CYY#CM-H98 |
 
 ---
 
@@ -383,22 +446,22 @@ Client ──connect──► server_sock
 
 ### 8.3 状态映射
 
-| 内部状态 | 指示灯颜色 | 显示文本 | 触发时机 |
-|----------|-----------|---------|---------|
-| `running` | 橙色 | 启动中... | start() 调用后 |
-| `listening` | 绿色 #00aa00 | 监听中 | bind 成功后 / 连接断开后 |
-| `connected` | 绿色 #00aa00 | 已连接 | 目标连接成功后 |
-| `stopped` | 灰色 | 已停止 | stop() 调用后 |
-| `error` | 红色 | 错误信息 | bind/connect 失败 |
+| 内部状态        | 指示灯颜色      | 显示文本   | 触发时机             |
+| ----------- | ---------- | ------ | ---------------- |
+| `running`   | 橙色         | 启动中... | start() 调用后      |
+| `listening` | 绿色 #00aa00 | 监听中    | bind 成功后 / 连接断开后 |
+| `connected` | 绿色 #00aa00 | 已连接    | 目标连接成功后          |
+| `stopped`   | 灰色         | 已停止    | stop() 调用后       |
+| `error`     | 红色         | 错误信息   | bind/connect 失败  |
 
 ---
 
 ## 9. 配置与持久化
 
-| 存储项 | 格式 | 文件 | 说明 |
-|--------|------|------|------|
-| 用户配置 | JSON | `config.json` | 启动时加载，保存时写入 |
-| 运行日志 | 纯文本（追加） | `build.log` | 所有日志和数据面板内容同步写入 |
+| 存储项  | 格式      | 文件            | 说明              |
+| ---- | ------- | ------------- | --------------- |
+| 用户配置 | JSON    | `config.json` | 启动时加载，保存时写入     |
+| 运行日志 | 纯文本（追加） | `build.log`   | 所有日志和数据面板内容同步写入 |
 
 ### config.json
 
@@ -415,29 +478,31 @@ Client ──connect──► server_sock
 
 ## 10. 关键常量
 
-| 常量 | 值 | 说明 |
-|------|-----|------|
-| `RECV_BUF` | 65536 (64KB) | socket recv 缓冲区大小 |
-| `IP_SERVICES` | api.ipify.org, ifconfig.me/ip, icanhazip.com | 外网IP检测服务列表（3个容错） |
-| `LOG_FILE` | build.log | 日志输出文件 |
-| `CONFIG_FILE` | config.json | 配置文件路径 |
-| Queue poll 间隔 | 100ms | `after(100)` 轮询间隔 |
-| Server accept timeout | 1s | 保证 stop() 及时响应 |
-| Forward recv timeout | 1s | 同上 |
-| Target connect timeout | 5s | 连接目标超时（DNS/网络容错） |
+| 常量                     | 值                                            | 说明                |
+| ---------------------- | -------------------------------------------- | ----------------- |
+| `RECV_BUF`             | 65536 (64KB)                                 | socket recv 缓冲区大小 |
+| `DELIMITER`            | `b"\r\n"`                                    | 消息边界分隔符（Base64 输出永不包含，安全） |
+| `BUF_MAX`              | 262144 (256KB)                               | 行缓冲上限，超出视为二进制协议直接展示 |
+| `IP_SERVICES`          | api.ipify.org, ifconfig.me/ip, icanhazip.com | 外网IP检测服务列表（3个容错）  |
+| `LOG_FILE`             | build.log                                    | 日志输出文件            |
+| `CONFIG_FILE`          | config.json                                  | 配置文件路径            |
+| Queue poll 间隔          | 100ms                                        | `after(100)` 轮询间隔 |
+| Server accept timeout  | 1s                                           | 保证 stop() 及时响应    |
+| Forward recv timeout   | 1s                                           | 同上                |
+| Target connect timeout | 5s                                           | 连接目标超时（DNS/网络容错）  |
 
 ---
 
 ## 11. 错误处理策略
 
-| 场景 | 处理方式 |
-|------|----------|
-| 端口绑定失败 | `queue.put("error", ...)` → GUI 状态灯变红，[启动] 恢复可用 |
-| 目标连接失败 | 日志记录错误，关闭客户端 socket，继续 accept |
-| recv/send 异常 | 静默退出转发循环，触发连接清理流程 |
-| JSON 配置文件损坏 | 静默使用默认配置 |
-| 外网IP检测失败 | 显示 "0.0.0.0"，绑定所有接口 |
-| pycryptodome 未安装 | `HAS_AES = False`，AES 功能在 UI 中可配置但无实际效果 |
-| 非整数端口输入 | `messagebox.showerror("错误", "端口号必须为整数")` |
-| 手动发送时未连接 | `messagebox.showwarning("提示", "未连接，无法发送")` |
-| HEX 格式无效 | `messagebox.showerror("错误", "HEX 格式无效")` |
+| 场景               | 处理方式                                            |
+| ---------------- | ----------------------------------------------- |
+| 端口绑定失败           | `queue.put("error", ...)` → GUI 状态灯变红，[启动] 恢复可用 |
+| 目标连接失败           | 日志记录错误，关闭客户端 socket，继续 accept                   |
+| recv/send 异常     | 静默退出转发循环，触发连接清理流程                               |
+| JSON 配置文件损坏      | 静默使用默认配置                                        |
+| 外网IP检测失败         | 显示 "0.0.0.0"，绑定所有接口                             |
+| pycryptodome 未安装 | `HAS_AES = False`，AES 功能在 UI 中可配置但无实际效果         |
+| 非整数端口输入          | `messagebox.showerror("错误", "端口号必须为整数")`        |
+| 手动发送时未连接         | `messagebox.showwarning("提示", "未连接，无法发送")`      |
+| HEX 格式无效         | `messagebox.showerror("错误", "HEX 格式无效")`        |

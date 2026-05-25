@@ -19,6 +19,8 @@ DEFAULT_CONFIG = {
     "target_port": 80,
 }
 RECV_BUF = 65536
+DELIMITER = b"\r\n"
+BUF_MAX = 256 * 1024  # 256KB 上限，超出则视为二进制协议直接展示
 IP_SERVICES = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]
 
 try:
@@ -219,7 +221,7 @@ class TcpForwarder:
         self.q.put(("log", "服务已停止"))
 
     def _forward(self, src: socket.socket, dst: socket.socket, tag: str):
-        """Unidirectional forward loop: recv from src, send to dst."""
+        """单向转发循环：从 src 接收原始数据，转发到 dst。"""
         peer = src.getpeername()
         peer_str = f"{peer[0]}:{peer[1]}"
         while not self._stop_event.is_set():
@@ -231,7 +233,7 @@ class TcpForwarder:
                 break
 
             if not data:
-                break  # peer closed
+                break  # 对端关闭
 
             try:
                 dst.sendall(data)
@@ -385,10 +387,21 @@ class App(tk.Tk):
 
         ttk.Button(send_frame, text="发送", command=self._send_manual).pack(side=tk.LEFT)
 
-        self.data_text = scrolledtext.ScrolledText(
-            data_frame, wrap=tk.NONE, font=("Consolas", 9)
+        data_frame_scroll = ttk.Frame(data_frame)
+        data_frame_scroll.pack(fill=tk.BOTH, expand=True)
+
+        self.data_text = tk.Text(
+            data_frame_scroll, wrap=tk.NONE, font=("Consolas", 9)
         )
-        self.data_text.pack(fill=tk.BOTH, expand=True)
+        data_v_scroll = ttk.Scrollbar(data_frame_scroll, orient=tk.VERTICAL, command=self.data_text.yview)
+        data_h_scroll = ttk.Scrollbar(data_frame_scroll, orient=tk.HORIZONTAL, command=self.data_text.xview)
+        self.data_text.configure(yscrollcommand=data_v_scroll.set, xscrollcommand=data_h_scroll.set)
+
+        self.data_text.grid(row=0, column=0, sticky="nsew")
+        data_v_scroll.grid(row=0, column=1, sticky="ns")
+        data_h_scroll.grid(row=1, column=0, sticky="ew")
+        data_frame_scroll.grid_rowconfigure(0, weight=1)
+        data_frame_scroll.grid_columnconfigure(0, weight=1)
 
         pw.add(data_frame, weight=3)
 
@@ -442,6 +455,7 @@ class App(tk.Tk):
         self._total_recv = 0
         self._conn_start = None
         self._log_once = set()
+        self._data_buf: dict[str, bytes] = {}
 
         self.forwarder.start(d["listen_ip"], d["listen_port"], d["target_host"], d["target_port"])
         self.btn_start.config(state=tk.DISABLED)
@@ -589,6 +603,7 @@ class App(tk.Tk):
 
     def _clear_data(self):
         self.data_text.delete("1.0", tk.END)
+        self._data_buf = {}
 
     # ── UI helpers ──────────────────────────────────────────────
 
@@ -605,25 +620,70 @@ class App(tk.Tk):
         self._write_file_log(line)
 
     def _append_data(self, tag: str, data: bytes):
+        """行缓冲：以 \\r\\n 为消息边界累积数据，对完整消息执行 Base64→AES→展示。"""
+        if not hasattr(self, "_data_buf"):
+            self._data_buf: dict[str, bytes] = {}
+        buf = self._data_buf.get(tag, b"") + data
+
+        while DELIMITER in buf:
+            msg, buf = buf.split(DELIMITER, 1)
+            self._display_msg(tag, msg)
+
+        # 缓冲区超过上限仍无 \r\n，视为二进制协议直接展示
+        if len(buf) > BUF_MAX:
+            self._display_msg(tag, buf)
+            buf = b""
+
+        self._data_buf[tag] = buf
+
+    def _display_msg(self, tag: str, data: bytes):
+        """展示一条完整消息：提取 Base64 前缀 → 解码 → AES 解密（仅解密 Base64 部分）→ 拼接后缀展示。"""
         tag_label = "上行" if tag == "C→T" else "下行"
         ts = _ts()
-        # decode chain: base64 → aes
-        display_data = data
+        # Step 1: Base64 解码（可能为 BASE64==#后缀 混合格式）
+        ciphertext = data
+        suffix = b""
         if self._use_base64.get():
-            try:
-                display_data = base64.b64decode(display_data)
-                self._log("[Base64] 解码成功", once="b64_ok")
-            except Exception as e:
-                self._log(f"[Base64] 解码失败: {e}", once="b64_err")
-        display_data = self._apply_aes_decrypt(display_data)
+            ciphertext, suffix = self._extract_b64(data)
+        # Step 2: AES 解密（仅对密文部分）
+        plaintext = self._apply_aes_decrypt(ciphertext)
+        # Step 3: 拼接展示
+        body_data = plaintext + suffix
         if self._view_mode.get() == "hex":
-            body = _fmt_hex(display_data)
+            body = _fmt_hex(body_data)
         else:
-            body = display_data.decode("utf-8", errors="replace")
+            body = body_data.decode("utf-8", errors="replace")
         block = f"[{ts}] [{tag_label}]\n{body}\n\n"
         self.data_text.insert(tk.END, block)
         self.data_text.see(tk.END)
         self._write_file_log(block)
+
+    def _extract_b64(self, data: bytes) -> tuple[bytes, bytes]:
+        """提取 Base64 前缀并解码。返回 (解码后数据, 非Base64后缀)。
+        纯 Base64 消息返回 (解码结果, b"")。
+        非 Base64 消息返回 (原始数据, b"")。"""
+        try:
+            decoded = base64.b64decode(data, validate=True)
+            self._log("[Base64] 解码成功", once="b64_ok")
+            return decoded, b""
+        except Exception:
+            pass
+        # 扫描 Base64 前缀（A-Za-z0-9+/=）
+        valid = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        end = 0
+        for byte in data:
+            if byte in valid:
+                end += 1
+            else:
+                break
+        if end >= 4:
+            try:
+                decoded = base64.b64decode(data[:end], validate=True)
+                self._log("[Base64] 解码成功", once="b64_ok")
+                return decoded, data[end:]
+            except Exception:
+                pass
+        return data, b""
 
     def _set_status(self, state: str, text: str | None):
         colors = {
